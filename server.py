@@ -24,7 +24,8 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, parse_qs, urlencode
+from urllib.request import Request, urlopen
 
 BASE_DIR = Path(__file__).resolve().parent
 # Optional .env support without requiring third-party packages.
@@ -221,6 +222,56 @@ def valid_http_url(value: str) -> bool:
         return False
 
 
+def youtube_video_id(value: str) -> str:
+    """Extract a video ID only from recognized YouTube URL formats."""
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        if parsed.scheme not in ("http", "https"):
+            return ""
+        if host == "youtu.be":
+            return parsed.path.strip("/").split("/")[0][:32]
+        if host in ("youtube.com", "m.youtube.com", "youtube-nocookie.com"):
+            query_id = parse_qs(parsed.query).get("v", [""])[0]
+            if query_id:
+                return query_id[:32]
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) >= 2 and parts[0] in ("embed", "shorts", "live"):
+                return parts[1][:32]
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_youtube_oembed(value: str) -> dict:
+    """Fetch public YouTube title/thumbnail metadata; never fetches arbitrary hosts."""
+    video_id = youtube_video_id(value)
+    if not video_id or not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id):
+        raise ValueError("URL YouTube មិនត្រឹមត្រូវ។")
+    canonical = f"https://www.youtube.com/watch?v={video_id}"
+    endpoint = "https://www.youtube.com/oembed?" + urlencode({"url": canonical, "format": "json"})
+    request = Request(endpoint, headers={"User-Agent": "KhmerDropshippingHub/1.0 (+video metadata preview)"})
+    with urlopen(request, timeout=8) as response:
+        if response.status != 200:
+            raise ValueError("មិនអាចទាញយកព័ត៌មានវីដេអូបានទេ។")
+        raw = response.read(1024 * 256)
+    data = json.loads(raw.decode("utf-8"))
+    thumbnail = str(data.get("thumbnail_url", ""))
+    thumb_host = (urlparse(thumbnail).hostname or "").lower()
+    if thumb_host not in ("i.ytimg.com", "img.youtube.com"):
+        thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return {
+        "video_id": video_id,
+        "title": str(data.get("title") or f"YouTube video {video_id}")[:180],
+        "author_name": str(data.get("author_name") or "YouTube creator")[:120],
+        "thumbnail_url": thumbnail,
+        "watch_url": canonical,
+        "embed_url": f"https://www.youtube-nocookie.com/embed/{video_id}",
+        "platform": "YouTube",
+        "kind": "youtube",
+    }
+
+
 class AppHandler(BaseHTTPRequestHandler):
     server_version = "KhmerTeamHub/1.0"
 
@@ -341,7 +392,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             return self.send_json({"ok": True, "service": "Khmer Dropshipping Team Hub"})
         if path.startswith("/api/"):
-            return self.handle_api_get(path)
+            return self.handle_api_get(path, parsed.query)
         if path.startswith("/media/"):
             return self.handle_media_get(path, attachment=False)
         if path.startswith("/download/"):
@@ -399,7 +450,7 @@ class AppHandler(BaseHTTPRequestHandler):
             """, (user_id,)).fetchone()
         return dict(row)
 
-    def handle_api_get(self, path: str):
+    def handle_api_get(self, path: str, query_string: str = ""):
         bootstrap_cookie = None
         if path == "/api/bootstrap":
             user = self.current_user()
@@ -410,6 +461,26 @@ class AppHandler(BaseHTTPRequestHandler):
             user = self.require_user()
             if not user:
                 return
+        if path == "/api/media/preview":
+            query = parse_qs(query_string)
+            source_url = query.get("url", [""])[0]
+            if not valid_http_url(source_url):
+                return self.send_error_json("សូមបញ្ចូល URL ត្រឹមត្រូវ។")
+            video_id = youtube_video_id(source_url)
+            if video_id:
+                try:
+                    return self.send_json(fetch_youtube_oembed(source_url))
+                except Exception as exc:
+                    # A thumbnail is still useful when oEmbed metadata is temporarily unavailable.
+                    return self.send_json({
+                        "kind": "youtube", "video_id": video_id,
+                        "title": f"YouTube video {video_id}", "author_name": "YouTube",
+                        "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                        "watch_url": f"https://www.youtube.com/watch?v={video_id}",
+                        "embed_url": f"https://www.youtube-nocookie.com/embed/{video_id}",
+                        "platform": "YouTube", "metadata_fallback": True,
+                    })
+            return self.send_error_json("ការទាញយក title និង banner ស្វ័យប្រវត្តិឥឡូវនេះគាំទ្រ YouTube។ សម្រាប់ platform ផ្សេង សូមប្រើ preview ឬចំណងជើងដោយដៃ។", 422)
         if path == "/api/bootstrap":
             with database() as conn:
                 resources = conn.execute("""
